@@ -1,0 +1,11 @@
+.env
+kite_session.json
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+env/
+.idea/
+.vscode/
+.DS_Store
