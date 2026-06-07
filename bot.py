@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import math
 import os
 import logging
 from datetime import datetime, timedelta, time
@@ -145,61 +146,103 @@ def load_stock_symbols(csv_path: str = "stocks.csv") -> list[str]:
     return symbols or ["NIFTY 50"]
 
 
-def build_compact_price_lines(symbols: list[str]) -> list[str]:
-    lines: list[str] = []
+async def check_and_send_threshold_alerts(application: Application) -> None:
+    """Check stock prices and alert when crossing 1% threshold levels."""
+    chat_id = get_alert_chat_id(application)
+    if not chat_id:
+        logger.warning("No alert chat ID available yet. Skipping threshold alert check.")
+        return
+
+    # Initialize threshold tracking state if not present
+    if "stock_thresholds" not in application.bot_data:
+        application.bot_data["stock_thresholds"] = {}
+    if "stock_initialized" not in application.bot_data:
+        application.bot_data["stock_initialized"] = set()
+
+    symbols = application.bot_data.get("stock_symbols", ["NIFTY 50"])
+    threshold_state = application.bot_data["stock_thresholds"]
+    initialized_stocks = application.bot_data["stock_initialized"]
+
     for symbol in symbols:
         try:
             symbol_code, data = get_quote(symbol)
+            
+            if not data:
+                logger.warning("No data for %s", symbol)
+                continue
+
             last_price = data.get("last_price")
             close_price = data.get("ohlc", {}).get("close")
-            if last_price is not None and close_price:
-                change_percent = (last_price - close_price) / close_price * 100
-                arrow = "↑" if change_percent >= 0 else "↓"
-                lines.append(f"{symbol_code.ljust(12)} ₹{last_price:,.2f} {arrow}{abs(change_percent):.2f}%")
-            elif last_price is not None:
-                lines.append(f"{symbol_code.ljust(12)} ₹{last_price:,.2f}")
+
+            if last_price is None or close_price is None or close_price == 0:
+                logger.warning("Incomplete price data for %s", symbol)
+                continue
+
+            # Calculate 1% threshold step
+            step = close_price * 0.01
+
+            # Calculate how many 1% steps the price has moved from close
+            price_diff = last_price - close_price
+            if price_diff >= 0:
+                steps_moved = math.floor(price_diff / step)
             else:
-                lines.append(f"{symbol_code.ljust(12)} N/A")
+                steps_moved = math.ceil(price_diff / step)
+
+            # Initialize state on first run, but do not alert on initialization
+            if symbol not in initialized_stocks:
+                threshold_state[symbol] = {
+                    "positive": max(steps_moved, 0),
+                    "negative": min(steps_moved, 0),
+                }
+                initialized_stocks.add(symbol)
+                logger.info(f"Initialized {symbol_code} at {steps_moved} steps")
+                continue
+
+            if symbol not in threshold_state:
+                threshold_state[symbol] = {"positive": 0, "negative": 0}
+
+            stock_state = threshold_state[symbol]
+            last_positive = stock_state["positive"]
+            last_negative = stock_state["negative"]
+
+            should_alert = False
+            direction = ""
+
+            if steps_moved > 0 and steps_moved > last_positive:
+                should_alert = True
+                direction = "⬆️ UP"
+                stock_state["positive"] = steps_moved
+            elif steps_moved < 0 and steps_moved < last_negative:
+                should_alert = True
+                direction = "⬇️ DOWN"
+                stock_state["negative"] = steps_moved
+
+            if should_alert:
+                threshold_price = close_price + (steps_moved * step)
+                change_amount = abs(price_diff)
+                change_percent = (abs(price_diff) / close_price) * 100
+
+                alert_message = (
+                    f"🚨 THRESHOLD ALERT\n"
+                    f"📊 {symbol_code}\n"
+                    f"Direction: {direction}\n"
+                    f"Current Price: ₹{last_price:,.2f}\n"
+                    f"Prev Close: ₹{close_price:,.2f}\n"
+                    f"Move: ₹{change_amount:,.2f} ({change_percent:.1f}%)\n"
+                    f"Threshold Price: ₹{threshold_price:,.2f}\n"
+                    f"Threshold Level: {abs(steps_moved)} × 1%\n"
+                    f"Time: {datetime.now():%H:%M:%S}"
+                )
+
+                await application.bot.send_message(chat_id=chat_id, text=alert_message)
+                logger.info(f"Alert sent for {symbol_code}: {steps_moved} steps at ₹{last_price:,.2f}")
+
         except Exception as e:
-            logger.warning("Failed to fetch quote for %s: %s", symbol, e)
-            normalized = symbol.strip().upper()
-            lines.append(f"{normalized.ljust(12)} ERR")
-    return lines
-
-
-def chunk_messages(header: str, lines: list[str], max_chars: int = 3900) -> list[str]:
-    messages: list[str] = []
-    current = header
-    for line in lines:
-        candidate = f"{current}{line}\n"
-        if len(candidate) > max_chars:
-            messages.append(current.rstrip())
-            current = f"{header}{line}\n"
-        else:
-            current = candidate
-    if current.strip():
-        messages.append(current.rstrip())
-    return messages
-
-
-async def send_stock_prices(application: Application) -> None:
-    """Send compact price updates for all symbols loaded from stocks.csv."""
-    chat_id = get_alert_chat_id(application)
-    if not chat_id:
-        logger.warning("No alert chat ID available yet. Skipping scheduled price alert.")
-        return
-
-    symbols = application.bot_data.get("stock_symbols", ["NIFTY 50"])
-    lines = build_compact_price_lines(symbols)
-    header = f"📈 Stock price update\n{datetime.now():%Y-%m-%d %H:%M:%S}\n\n"
-    messages = chunk_messages(header, lines)
-
-    for message in messages:
-        await application.bot.send_message(chat_id=chat_id, text=message)
+            logger.warning("Error checking threshold for %s: %s", symbol, e)
 
 
 async def price_scheduler(application: Application) -> None:
-    """Send stock prices every 5 minutes, aligned to 5-minute marks."""
+    """Check stock thresholds every 5 minutes, aligned to 5-minute marks."""
     now = datetime.now()
     minutes_to_add = (5 - (now.minute % 5)) % 5
     if minutes_to_add == 0 and now.second > 0:
@@ -211,9 +254,9 @@ async def price_scheduler(application: Application) -> None:
 
     while True:
         try:
-            await send_stock_prices(application)
+            await check_and_send_threshold_alerts(application)
         except Exception as e:
-            logger.exception("Error while sending scheduled stock prices: %s", e)
+            logger.exception("Error while checking stock thresholds: %s", e)
         await asyncio.sleep(5 * 60)
 
 
