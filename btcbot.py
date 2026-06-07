@@ -1,7 +1,7 @@
 import asyncio
 import os
 from decimal import Decimal, ROUND_DOWN
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 from dotenv import load_dotenv
@@ -17,6 +17,8 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise RuntimeError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set in .env file")
 
 POLL_INTERVAL = 30
+ALERTS_PER_PART = 20
+IST = timezone(timedelta(hours=5, minutes=30))
 
 COINS = {
     "BTC":  {"symbol": "BTCUSDT",  "step": Decimal("100"),  "name": "Bitcoin"},
@@ -46,9 +48,9 @@ def price_to_level(price: Decimal, step: Decimal) -> Decimal:
 async def check_and_alert(bot: Bot, states: dict) -> None:
     try:
         prices = fetch_prices()
-        now_utc = datetime.now(timezone.utc)
-        time_str = now_utc.strftime("%H:%M UTC")
-        today_str = now_utc.strftime("%Y-%m-%d")
+        now_ist = datetime.now(IST)
+        time_str = now_ist.strftime("%H:%M IST")
+        today_str = now_ist.strftime("%Y-%m-%d")
 
         for ticker, cfg in COINS.items():
             price = prices.get(cfg["symbol"])
@@ -58,10 +60,11 @@ async def check_and_alert(bot: Bot, states: dict) -> None:
             current_level = price_to_level(price, cfg["step"])
             state = states[ticker]
 
-            # Reset list at midnight for new day
+            # Reset on new day (IST midnight)
             if state["today"] != today_str:
                 state["today"] = today_str
                 state["alerts"] = []
+                state["part"] = 1
                 state["last_level"] = None
 
             if state["last_level"] is None:
@@ -75,7 +78,13 @@ async def check_and_alert(bot: Bot, states: dict) -> None:
                 state["alerts"].append(f"{emoji}  {current_level}  {time_str}")
                 state["last_level"] = current_level
 
-                message = f"{ticker} ALERTS — {today_str}\n" + "\n".join(state["alerts"])
+                # Start new part after every 20 alerts
+                if len(state["alerts"]) > ALERTS_PER_PART:
+                    state["alerts"] = [f"{emoji}  {current_level}  {time_str}"]
+                    state["part"] += 1
+
+                part_label = f" (Part {state['part']})" if state["part"] > 1 else ""
+                message = f"{ticker} ALERTS — {today_str}{part_label}\n" + "\n".join(state["alerts"])
                 await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
                 print(f"[ALERT] {ticker} {emoji} {current_level} at {time_str}")
 
@@ -86,9 +95,9 @@ async def check_and_alert(bot: Bot, states: dict) -> None:
 async def main():
     request = HTTPXRequest(connect_timeout=30, read_timeout=30, write_timeout=30)
     async with Bot(token=TELEGRAM_TOKEN, request=request) as bot:
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
         states = {
-            ticker: {"last_level": None, "alerts": [], "today": today_str}
+            ticker: {"last_level": None, "alerts": [], "part": 1, "today": today_str}
             for ticker in COINS
         }
         print("Crypto alert bot running. Polling every 30s... (Ctrl+C to stop)")
