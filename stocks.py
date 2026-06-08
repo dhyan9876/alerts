@@ -1,13 +1,14 @@
 import asyncio
 import csv
 import os
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_FLOOR
 from datetime import datetime, timezone, timedelta
 
-import requests
 from dotenv import load_dotenv
 from telegram import Bot
 from telegram.request import HTTPXRequest
+
+from login import get_kite_instance
 
 load_dotenv()
 
@@ -17,60 +18,71 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise RuntimeError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set in .env file")
 
-POLL_INTERVAL = 30
+print(f"Using TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID}")
+
+POLL_INTERVAL = 60
 ALERTS_PER_PART = 20
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
-def load_coins(csv_path: str = "crypto.csv") -> dict:
-    coins = {}
-    with open(csv_path, newline="") as f:
+def load_stocks() -> dict:
+    if not os.path.exists("last_base.csv"):
+        print("last_base.csv not found — generating from previous day's data...")
+        from lastalert import generate_last_base
+        generate_last_base()
+
+    stocks = {}
+    with open("last_base.csv", newline="") as f:
         for row in csv.reader(f):
+            if not row or len(row) < 3:
+                continue
             symbol, base, step = row[0].strip(), row[1].strip(), row[2].strip()
-            ticker = symbol.replace("USDT", "")
-            coins[ticker] = {"symbol": symbol, "base": Decimal(base), "step": Decimal(step)}
-    return coins
+            stocks[symbol] = {
+                "instrument": f"NSE:{symbol}",
+                "base": Decimal(base),
+                "step": Decimal(step),
+            }
+    return stocks
 
 
-COINS = load_coins()
+STOCKS = load_stocks()
 
 
-def fetch_prices() -> dict:
-    response = requests.get(
-        "https://api.binance.com/api/v3/ticker/price",
-        timeout=10,
-    )
-    response.raise_for_status()
-    data = response.json()
-    symbols_needed = {cfg["symbol"] for cfg in COINS.values()}
-    return {item["symbol"]: Decimal(item["price"]) for item in data if item["symbol"] in symbols_needed}
+def fetch_prices(kite) -> dict:
+    instruments = [cfg["instrument"] for cfg in STOCKS.values()]
+    ltp_data = kite.ltp(instruments)
+    return {
+        symbol: Decimal(str(ltp_data[cfg["instrument"]]["last_price"]))
+        for symbol, cfg in STOCKS.items()
+        if cfg["instrument"] in ltp_data
+    }
 
 
 def price_to_level(price: Decimal, base: Decimal, step: Decimal) -> Decimal:
-    return ((price - base) / step).to_integral_value(rounding=ROUND_DOWN) * step + base
+    return ((price - base) / step).to_integral_value(rounding=ROUND_FLOOR) * step + base
 
 
-async def check_and_alert(bot: Bot, states: dict) -> None:
+async def check_and_alert(bot: Bot, kite, states: dict) -> None:
     try:
-        prices = fetch_prices()
+        prices = fetch_prices(kite)
         now_ist = datetime.now(IST)
         time_str = now_ist.strftime("%H:%M IST")
         today_str = now_ist.strftime("%Y-%m-%d")
 
-        for ticker, cfg in COINS.items():
-            price = prices.get(cfg["symbol"])
+        for symbol, cfg in STOCKS.items():
+            price = prices.get(symbol)
             if price is None:
                 continue
 
             current_level = price_to_level(price, cfg["base"], cfg["step"])
-            state = states[ticker]
+            state = states[symbol]
 
-            # Reset on new day (IST midnight)
             if state["today"] != today_str:
                 state["today"] = today_str
                 state["alerts"] = []
                 state["part"] = 1
                 state["last_level"] = None
+                state["last_display_level"] = cfg["base"]
 
             if state["last_level"] is None:
                 state["last_level"] = current_level
@@ -80,37 +92,45 @@ async def check_and_alert(bot: Bot, states: dict) -> None:
                 is_up = current_level > state["last_level"]
                 emoji = "🟢" if is_up else "🔴"
 
-                state["alerts"].append(f"{emoji}  {current_level}  {time_str}")
+                display_level = current_level if is_up else current_level + cfg["step"]
                 state["last_level"] = current_level
 
-                # Start new part after every 20 alerts
+                if display_level == state["last_display_level"]:
+                    continue
+
+                state["last_display_level"] = display_level
+                state["alerts"].append(f"{emoji}  {display_level}  {time_str}")
+
                 if len(state["alerts"]) > ALERTS_PER_PART:
-                    state["alerts"] = [f"{emoji}  {current_level}  {time_str}"]
+                    state["alerts"] = [f"{emoji}  {display_level}  {time_str}"]
                     state["part"] += 1
 
                 part_label = f" (Part {state['part']})" if state["part"] > 1 else ""
-                message = f"{ticker} ALERTS — {today_str}{part_label}\n" + "\n".join(state["alerts"])
+                header = f"{symbol} ALERTS — {today_str}{part_label}\nLast Base: {cfg['base']} | Alert Diff: {cfg['step']}"
+                message = header + "\n" + "\n".join(state["alerts"])
                 await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-                print(f"[ALERT] {ticker} {emoji} {current_level} at {time_str}")
+                print(f"[ALERT] {symbol} {emoji} {display_level} at {time_str}")
 
     except Exception as e:
         print(f"[ERROR] {e}")
 
 
 async def main():
+    kite = get_kite_instance()
     request = HTTPXRequest(connect_timeout=60, read_timeout=60, write_timeout=60, pool_timeout=60)
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
     states = {
-        ticker: {"last_level": None, "alerts": [], "part": 1, "today": today_str}
-        for ticker in COINS
+        symbol: {"last_level": None, "last_display_level": cfg["base"], "alerts": [], "part": 1, "today": today_str}
+        for symbol, cfg in STOCKS.items()
     }
+
     while True:
         try:
             async with Bot(token=TELEGRAM_TOKEN, request=request) as bot:
-                print("Crypto alert bot running. Polling every 30s... (Ctrl+C to stop)")
+                print("Stock alert bot running. Polling every 60s... (Ctrl+C to stop)")
 
                 while True:
-                    await check_and_alert(bot, states)
+                    await check_and_alert(bot, kite, states)
                     await asyncio.sleep(POLL_INTERVAL)
 
         except KeyboardInterrupt:
