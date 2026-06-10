@@ -4,59 +4,53 @@ import os
 from decimal import Decimal, ROUND_FLOOR
 from datetime import datetime, timezone, timedelta
 
+import requests
 from dotenv import load_dotenv
 from telegram import Bot
 from telegram.request import HTTPXRequest
 
-from login import get_kite_instance
-from stockpastalert import fill_gaps, alerts_file, get_last_entry
+from cryptopastalert import fill_gaps, alerts_file, get_last_entry
 
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+TELEGRAM_TOKEN = os.getenv("CRYPTO_TOKEN")
+TELEGRAM_CHAT_ID = int(os.getenv("CRYPTO_CHAT_ID", "0"))
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise RuntimeError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set in .env file")
+    raise RuntimeError("CRYPTO_TOKEN and CRYPTO_CHAT_ID must be set in .env file")
 
-print(f"Using TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID}")
-
-POLL_INTERVAL = 60
-ALERTS_PER_PART = 20
+POLL_INTERVAL = 30
+ALERTS_PER_PART = 40
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
-def load_stocks(csv_path: str = "stocks.csv") -> dict:
-    stocks = {}
+def load_coins(csv_path: str = "crypto.csv") -> dict:
+    coins = {}
     with open(csv_path, newline="") as f:
         for row in csv.reader(f):
-            if not row or len(row) < 3:
-                continue
             symbol, base, step = row[0].strip(), row[1].strip(), row[2].strip()
-            stocks[symbol] = {
-                "instrument": f"NSE:{symbol}",
-                "base": Decimal(base),
-                "step": Decimal(step),
-            }
-    return stocks
+            ticker = symbol.replace("USDT", "")
+            coins[ticker] = {"symbol": symbol, "base": Decimal(base), "step": Decimal(step)}
+    return coins
 
 
-def fetch_prices(kite, stocks: dict) -> dict:
-    instruments = [cfg["instrument"] for cfg in stocks.values()]
-    ltp_data = kite.ltp(*instruments)
-    return {
-        symbol: Decimal(str(ltp_data[cfg["instrument"]]["last_price"]))
-        for symbol, cfg in stocks.items()
-        if cfg["instrument"] in ltp_data
-    }
+def fetch_prices(coins: dict) -> dict:
+    response = requests.get(
+        "https://api.binance.com/api/v3/ticker/price",
+        timeout=10,
+    )
+    response.raise_for_status()
+    data = response.json()
+    symbols_needed = {cfg["symbol"] for cfg in coins.values()}
+    return {item["symbol"]: Decimal(item["price"]) for item in data if item["symbol"] in symbols_needed}
 
 
 def price_to_level(price: Decimal, base: Decimal, step: Decimal) -> Decimal:
     return ((price - base) / step).to_integral_value(rounding=ROUND_FLOOR) * step + base
 
 
-def append_to_log(symbol: str, level: Decimal, direction: str, dt_ist: datetime) -> None:
-    path = alerts_file(symbol)
+def append_to_log(ticker: str, level: Decimal, direction: str, dt_ist: datetime) -> None:
+    path = alerts_file(ticker)
     file_exists = os.path.exists(path)
     with open(path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["date", "time", "level", "direction"])
@@ -70,9 +64,9 @@ def append_to_log(symbol: str, level: Decimal, direction: str, dt_ist: datetime)
         })
 
 
-def load_all_alerts(symbol: str) -> tuple:
+def load_all_alerts(ticker: str) -> tuple:
     """Read ALL alerts from CSV (all dates). Returns (current_part_alerts, part_number)."""
-    path = alerts_file(symbol)
+    path = alerts_file(ticker)
     if not os.path.exists(path):
         return [], 1
     all_alerts = []
@@ -90,35 +84,33 @@ def load_all_alerts(symbol: str) -> tuple:
     return all_alerts[start_idx:], part
 
 
-async def send_initial_alerts(bot: Bot, states: dict, stocks: dict, tickers_with_new: set) -> None:
-    """On startup, send full alert history for stocks that had new gap-fill data."""
-    for symbol in tickers_with_new:
-        alerts = states[symbol]["alerts"]
+async def send_initial_alerts(bot: Bot, states: dict, tickers_with_new: set) -> None:
+    """On startup, send full alert history for coins that had new gap-fill data."""
+    for ticker in tickers_with_new:
+        alerts = states[ticker]["alerts"]
         if not alerts:
             continue
-        cfg = stocks[symbol]
-        part = states[symbol]["part"]
+        part = states[ticker]["part"]
         part_label = f" (Part {part})" if part > 1 else ""
-        header = f"{symbol} ALERTS{part_label}\nBase: {cfg['base']} | Step: {cfg['step']}"
-        message = header + "\n" + "\n".join(alerts)
+        message = f"{ticker} ALERTS{part_label}\n" + "\n".join(alerts)
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
         await asyncio.sleep(0.5)
 
 
-async def check_and_alert(bot: Bot, kite, states: dict, stocks: dict) -> None:
+async def check_and_alert(bot: Bot, states: dict, coins: dict) -> None:
     try:
-        prices = fetch_prices(kite, stocks)
+        prices = fetch_prices(coins)
         now_ist = datetime.now(IST)
         time_str = now_ist.strftime("%H:%M IST %d %b")
         today_str = now_ist.strftime("%Y-%m-%d")
 
-        for symbol, cfg in stocks.items():
-            price = prices.get(symbol)
+        for ticker, cfg in coins.items():
+            price = prices.get(cfg["symbol"])
             if price is None:
                 continue
 
             current_level = price_to_level(price, cfg["base"], cfg["step"])
-            state = states[symbol]
+            state = states[ticker]
 
             if state["today"] != today_str:
                 state["today"] = today_str
@@ -141,36 +133,34 @@ async def check_and_alert(bot: Bot, kite, states: dict, stocks: dict) -> None:
                 state["last_display_level"] = display_level
                 state["alerts"].append(f"{emoji}  {display_level}  {time_str}")
 
-                append_to_log(symbol, display_level, direction, now_ist)
+                append_to_log(ticker, display_level, direction, now_ist)
 
                 if len(state["alerts"]) > ALERTS_PER_PART:
                     state["alerts"] = [f"{emoji}  {display_level}  {time_str}"]
                     state["part"] += 1
 
                 part_label = f" (Part {state['part']})" if state["part"] > 1 else ""
-                header = f"{symbol} ALERTS{part_label}\nBase: {cfg['base']} | Step: {cfg['step']}"
-                message = header + "\n" + "\n".join(state["alerts"])
+                message = f"{ticker} ALERTS{part_label}\n" + "\n".join(state["alerts"])
                 await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-                print(f"[ALERT] {symbol} {emoji} {display_level} at {time_str}")
+                print(f"[ALERT] {ticker} {emoji} {display_level} at {time_str}")
 
     except Exception as e:
         print(f"[ERROR] {e}")
 
 
 async def main():
-    kite = get_kite_instance()
-    stocks = load_stocks()
     request = HTTPXRequest(connect_timeout=60, read_timeout=60, write_timeout=60, pool_timeout=60)
 
     while True:
         try:
-            new_alerts = fill_gaps(kite, stocks)
+            coins = load_coins()
+            new_alerts = fill_gaps(coins)
 
             today_str = datetime.now(IST).strftime("%Y-%m-%d")
             states = {}
-            for symbol in stocks:
-                all_alerts, all_part = load_all_alerts(symbol)
-                states[symbol] = {
+            for ticker in coins:
+                all_alerts, all_part = load_all_alerts(ticker)
+                states[ticker] = {
                     "last_level": None,
                     "last_display_level": None,
                     "alerts": all_alerts,
@@ -178,19 +168,19 @@ async def main():
                     "today": today_str,
                 }
 
-            tickers_with_new = {symbol for symbol, lines in new_alerts.items() if lines}
+            tickers_with_new = {ticker for ticker, lines in new_alerts.items() if lines}
 
-            for symbol in stocks:
-                last = get_last_entry(symbol)
+            for ticker in coins:
+                last = get_last_entry(ticker)
                 if last:
-                    states[symbol]["last_display_level"] = Decimal(last[2])
+                    states[ticker]["last_display_level"] = Decimal(last[2])
 
             async with Bot(token=TELEGRAM_TOKEN, request=request) as bot:
-                await send_initial_alerts(bot, states, stocks, tickers_with_new)
-                print("Stock alert bot running. Polling every 60s... (Ctrl+C to stop)")
+                await send_initial_alerts(bot, states, tickers_with_new)
+                print("Crypto alert bot running. Polling every 30s... (Ctrl+C to stop)")
 
                 while True:
-                    await check_and_alert(bot, kite, states, stocks)
+                    await check_and_alert(bot, states, coins)
                     await asyncio.sleep(POLL_INTERVAL)
 
         except KeyboardInterrupt:
